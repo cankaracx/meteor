@@ -1,40 +1,17 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
-import math, os
-
-
-
-
-import sys, os
-
-def resource_path(filename: str) -> str:
-    """Exe çalışırken aynı klasördeki dosyaları bulmak için"""
-    if getattr(sys, 'frozen', False):
-        # PyInstaller exe içinden
-        base = os.path.dirname(sys.executable)
-    else:
-        # Normal python script çalıştırırken
-        base = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base, filename)
-
-
-
-
-
-
-
-import sys
+import math, os, sys
 
 def resource_path(relpath: str) -> str:
-    # PyInstaller ile paketlenmişse sys._MEIPASS olur
-    base = getattr(sys, "_MEIPASS", os.path.abspath("."))
-    return os.path.join(base, relpath)
-
-
-
-
-
-
+    """Resolve bundled files for source runs and PyInstaller builds."""
+    if getattr(sys, "frozen", False):
+        for base in (getattr(sys, "_MEIPASS", None), os.path.dirname(sys.executable)):
+            if base:
+                candidate = os.path.join(base, relpath)
+                if os.path.exists(candidate):
+                    return candidate
+        return os.path.join(os.path.dirname(sys.executable), relpath)
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), relpath)
 
 # ===================== NASA NeoWs CSV -> PRESET dönüştürücü =====================
 def load_presets_from_csv(csv_path, default_rho=3000.0, hazard_rho=3500.0, limit=None):
@@ -312,7 +289,7 @@ class MeteorCitySim:
         ve combobox listesini tazeler.
         """
         try:
-            added = load_presets_from_csv("neo_feed.csv")
+            added = load_presets_from_csv(resource_path("neo_feed.csv"))
         except Exception as e:
             messagebox.showerror("Hata", f"CSV okunamadı:\n{e}")
             return
@@ -417,13 +394,16 @@ class MeteorCitySim:
         self.info.config(text=f"Energy: {E:.2f} Mt TNT  (Hiroşima ≈ {h_eq:,.0f}x)\n"
                               f"Crater: {D:.2f} km — {level}")
 
-        # 81 il tablosu — nüfus tavanıyla sınırlı
+        # 81 il tablosu — en ağır kayıplar üstte, nüfus tavanıyla sınırlı
         for r in self.tree.get_children():
             self.tree.delete(r)
-        for city in sorted(TURKEY_81):
+        rows = []
+        for city in TURKEY_81:
             dens = CITY_DENSITIES_81.get(city, 60.0)
             pop_cap = CITY_POP_CAP.get(city, DEFAULT_POP_GUESS)
             dead, inj = casualties_capped(D, dens, pop_cap)
+            rows.append((dead, city, dens, pop_cap, inj))
+        for dead, city, dens, pop_cap, inj in sorted(rows, reverse=True):
             self.tree.insert("", "end", values=(city, dens, f"{pop_cap:,}", f"{dead:,}", f"{inj:,}"))
 
     def open_seismic(self):

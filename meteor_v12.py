@@ -1,14 +1,14 @@
 import tkinter as tk
-from tkinter import ttk, messagebox
-import math, os
+from tkinter import ttk, messagebox, filedialog
+import math
+import os
+import sys
 
 
 
 
-import sys, os
-
-def resource_path(filename: str) -> str:
-    """Exe çalışırken aynı klasördeki dosyaları bulmak için"""
+def _legacy_resource_path(filename: str) -> str:
+    """Compatibility helper retained for older packaged builds."""
     if getattr(sys, 'frozen', False):
         # PyInstaller exe içinden
         base = os.path.dirname(sys.executable)
@@ -26,8 +26,8 @@ def resource_path(filename: str) -> str:
 import sys
 
 def resource_path(relpath: str) -> str:
-    # PyInstaller ile paketlenmişse sys._MEIPASS olur
-    base = getattr(sys, "_MEIPASS", os.path.abspath("."))
+    """Return a resource path for both source and PyInstaller builds."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, relpath)
 
 
@@ -278,6 +278,26 @@ class MeteorCitySim:
                              justify="left", fg="#ddd", bg="#0a0a0a", font=("Consolas", 10))
         self.info.pack(anchor="w", padx=12, pady=8)
 
+        # Sonuç araçları
+        tools = tk.Frame(side, bg="#0a0a0a")
+        tools.pack(fill="x", padx=12, pady=(2, 0))
+        tk.Label(tools, text="Şehir filtrele", fg="#ffcccc", bg="#0a0a0a",
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        search_row = tk.Frame(tools, bg="#0a0a0a")
+        search_row.pack(fill="x", pady=(3, 5))
+        self.city_filter = tk.StringVar()
+        self.city_filter.trace_add("write", lambda *_: self.render_results())
+        ttk.Entry(search_row, textvariable=self.city_filter).pack(side="left", fill="x", expand=True)
+        tk.Button(search_row, text="Temizle", command=lambda: self.city_filter.set(""),
+                  bg="#151515", fg="#ffcccc", activebackground="#1c1c1c",
+                  activeforeground="#fff", relief="flat").pack(side="left", padx=(6, 0))
+        tk.Button(search_row, text="CSV Aktar", command=self.export_results,
+                  bg="#151515", fg="#ff8a8a", activebackground="#1c1c1c",
+                  activeforeground="#fff", relief="flat").pack(side="left", padx=(6, 0))
+        self.result_count = tk.Label(tools, text="Şehirleri karşılaştırmak için etkiyi çalıştırın",
+                                     fg="#aaa", bg="#0a0a0a", font=("Segoe UI", 9))
+        self.result_count.pack(anchor="w")
+
         # Tablo (81 il)
         style = ttk.Style()
         try: style.theme_use("clam")
@@ -286,15 +306,25 @@ class MeteorCitySim:
                         fieldbackground="#0f0f0f", rowheight=22, bordercolor="#222", borderwidth=0)
         style.configure("Treeview.Heading", background="#111", foreground="#ff3b3b",
                         font=("Segoe UI", 10, "bold"))
+        style.map("Treeview", background=[("selected", "#8a1f1f")], foreground=[("selected", "#ffffff")])
         cols = ("City","Dens(/km²)","PopCap","Dead","Injured")
         self.tree = ttk.Treeview(side, columns=cols, show="headings", height=18, style="Treeview")
-        for c in cols: self.tree.heading(c, text=c)
+        self.sort_column = "City"
+        self.sort_reverse = False
+        self.result_rows = []
+        for c in cols:
+            self.tree.heading(c, text=c, command=lambda column=c: self.sort_results(column))
+        self.tree.column("City", width=120, anchor="w")
+        for c in cols[1:]:
+            self.tree.column(c, width=88, anchor="e")
         self.tree.pack(fill="both", expand=True, padx=12, pady=12)
 
         # İlk çizim
         self.last_D = None
         self.last_E_Mt = None
         self.canvas.bind("<Configure>", lambda e: self.draw_scene(self.last_D))
+        root.bind("<Control-Return>", lambda _e: self.impact())
+        root.bind("<Control-s>", lambda _e: self.export_results())
 
     def apply_preset(self):
         name = self.preset_var.get()
@@ -312,7 +342,7 @@ class MeteorCitySim:
         ve combobox listesini tazeler.
         """
         try:
-            added = load_presets_from_csv("neo_feed.csv")
+            added = load_presets_from_csv(resource_path("neo_feed.csv"))
         except Exception as e:
             messagebox.showerror("Hata", f"CSV okunamadı:\n{e}")
             return
@@ -386,6 +416,11 @@ class MeteorCitySim:
             cx, cy = (left+right)//2, (top+bottom)//2
             r = (D_km * px_per_km) / 2.0
             r = max(4, min(r, (right-left)*0.45))
+            affected_r = max(12, min(D_km * 3.0 * px_per_km, (right-left)*0.48))
+            c.create_oval(cx-affected_r, cy-affected_r, cx+affected_r, cy+affected_r,
+                          outline="#ffb21a", width=2, dash=(7, 5))
+            c.create_text(cx+affected_r, cy, text="  tahmini etki alanı",
+                          anchor="w", fill="#ffb21a", font=("Segoe UI", 9, "bold"))
             c.create_oval(cx-r, cy-r, cx+r, cy+r, outline="#ff6b6b", width=3)
             c.create_oval(cx-r*0.94, cy-r*0.94, cx+r*0.94, cy+r*0.94, fill="#7a00f0", outline="")
             if self.last_E_Mt is not None:
@@ -417,14 +452,79 @@ class MeteorCitySim:
         self.info.config(text=f"Energy: {E:.2f} Mt TNT  (Hiroşima ≈ {h_eq:,.0f}x)\n"
                               f"Crater: {D:.2f} km — {level}")
 
-        # 81 il tablosu — nüfus tavanıyla sınırlı
-        for r in self.tree.get_children():
-            self.tree.delete(r)
+        # 81 il karşılaştırması — nüfus tavanıyla sınırlı
+        self.result_rows = []
         for city in sorted(TURKEY_81):
             dens = CITY_DENSITIES_81.get(city, 60.0)
             pop_cap = CITY_POP_CAP.get(city, DEFAULT_POP_GUESS)
             dead, inj = casualties_capped(D, dens, pop_cap)
-            self.tree.insert("", "end", values=(city, dens, f"{pop_cap:,}", f"{dead:,}", f"{inj:,}"))
+            self.result_rows.append((city, dens, pop_cap, dead, inj))
+        self.render_results()
+
+    def visible_results(self):
+        query = self.city_filter.get().strip().casefold()
+        rows = [
+            row for row in self.result_rows
+            if not query or query in row[0].casefold()
+        ]
+        column_index = {
+            "City": 0, "Dens(/km²)": 1, "PopCap": 2, "Dead": 3, "Injured": 4
+        }[self.sort_column]
+        rows.sort(
+            key=lambda row: row[column_index].casefold()
+            if column_index == 0 else row[column_index],
+            reverse=self.sort_reverse,
+        )
+        return rows
+
+    def render_results(self):
+        if not hasattr(self, "tree"):
+            return
+        rows = self.visible_results()
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        for city, dens, pop_cap, dead, injured in rows:
+            self.tree.insert(
+                "", "end",
+                values=(city, f"{dens:g}", f"{pop_cap:,}", f"{dead:,}", f"{injured:,}")
+            )
+        total = len(self.result_rows)
+        self.result_count.config(
+            text=f"{total} senaryodan {len(rows)} tanesi gösteriliyor"
+            if total else "Şehirleri karşılaştırmak için etkiyi çalıştırın"
+        )
+
+    def sort_results(self, column):
+        if self.sort_column == column:
+            self.sort_reverse = not self.sort_reverse
+        else:
+            self.sort_column = column
+            self.sort_reverse = False
+        self.render_results()
+
+    def export_results(self):
+        rows = self.visible_results()
+        if not rows:
+            messagebox.showinfo("Dışa Aktar", "Sonuçları aktarmadan önce etkiyi çalıştırın.")
+            return
+        output_path = filedialog.asksaveasfilename(
+            title="Etki senaryolarını dışa aktar",
+            defaultextension=".csv",
+            filetypes=[("CSV dosyaları", "*.csv")],
+            initialfile="meteor-etki-senaryolari.csv",
+        )
+        if not output_path:
+            return
+        import csv
+        try:
+            with open(output_path, "w", newline="", encoding="utf-8") as output:
+                writer = csv.writer(output)
+                writer.writerow(("Şehir", "Yoğunluk / km²", "Nüfus tavanı", "Ölü", "Yaralı"))
+                writer.writerows(rows)
+        except OSError as error:
+            messagebox.showerror("Dışa aktarma başarısız", str(error))
+            return
+        messagebox.showinfo("Dışa aktarma tamamlandı", f"{len(rows)} senaryo kaydedildi.")
 
     def open_seismic(self):
         if not self.last_D:

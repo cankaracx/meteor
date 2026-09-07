@@ -1,93 +1,175 @@
-import sys, json, csv, os, time
-from datetime import datetime
+import argparse
+import csv
+import os
+import sys
+import tempfile
+import time
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
 import requests
 
-API_KEY = "njGUd5KQp3qvKmRseVn2wR3kmeqGKMg3r9WlM07g"  # senin key
-START = "2025-10-01"
-END   = "2025-10-04"
-URL   = "https://api.nasa.gov/neo/rest/v1/feed"
-CSV_OUT = "neo_feed.csv"
+URL = "https://api.nasa.gov/neo/rest/v1/feed"
+CSV_FIELDS = [
+    "date",
+    "neo_id",
+    "name",
+    "estimated_diameter_m_min",
+    "estimated_diameter_m_max",
+    "is_potentially_hazardous",
+    "close_approach_date",
+    "rel_velocity_km_h",
+    "miss_distance_km",
+]
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
-def main():
-    log("Başlıyorum…")
-    log(f"Tarih aralığı: {START} → {END}")
-    log("İstek atılıyor…")
+def parse_date(value):
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("date must use YYYY-MM-DD") from error
+
+def fetch_feed(start, end, api_key, session=requests):
+    try:
+        response = session.get(
+            URL,
+            params={
+                "start_date": start.isoformat(),
+                "end_date": end.isoformat(),
+                "api_key": api_key,
+            },
+            timeout=(5, 30),
+        )
+        response.raise_for_status()
+    except requests.RequestException as error:
+        raise RuntimeError(f"NASA request failed: {error}") from error
 
     try:
-        r = requests.get(URL, params={
-            "start_date": START,
-            "end_date": END,
-            "api_key": API_KEY
-        }, timeout=30)
-    except Exception as e:
-        log(f"HATA: İstek atılamadı -> {e}")
-        sys.exit(1)
+        payload = response.json()
+    except requests.JSONDecodeError as error:
+        raise RuntimeError("NASA returned an unreadable response") from error
+    if not isinstance(payload.get("near_earth_objects"), dict):
+        raise RuntimeError("NASA response is missing near_earth_objects")
+    return payload
 
-    log(f"HTTP durum kodu: {r.status_code}")
-    if r.status_code != 200:
-        log(f"HATA: Beklenmeyen durum kodu. Gövde: {r.text[:400]} ...")
-        sys.exit(1)
+def rows_from_feed(payload):
+    rows = []
+    skipped = 0
+    for feed_date, objects in sorted(payload["near_earth_objects"].items()):
+        for neo in objects:
+            try:
+                diameter = neo["estimated_diameter"]["meters"]
+                approaches = neo.get("close_approach_data") or []
+                approach = next(
+                    (
+                        item
+                        for item in approaches
+                        if item.get("close_approach_date") == feed_date
+                    ),
+                    approaches[0] if approaches else {},
+                )
+                rows.append(
+                    {
+                        "date": feed_date,
+                        "neo_id": neo.get("id", ""),
+                        "name": neo.get("name", ""),
+                        "estimated_diameter_m_min": f"{float(diameter['estimated_diameter_min']):.3f}",
+                        "estimated_diameter_m_max": f"{float(diameter['estimated_diameter_max']):.3f}",
+                        "is_potentially_hazardous": bool(
+                            neo.get("is_potentially_hazardous_asteroid", False)
+                        ),
+                        "close_approach_date": approach.get(
+                            "close_approach_date_full",
+                            approach.get("close_approach_date", ""),
+                        ),
+                        "rel_velocity_km_h": approach.get(
+                            "relative_velocity", {}
+                        ).get("kilometers_per_hour", ""),
+                        "miss_distance_km": approach.get("miss_distance", {}).get(
+                            "kilometers", ""
+                        ),
+                    }
+                )
+            except (KeyError, TypeError, ValueError):
+                skipped += 1
+    return rows, skipped
 
+def write_csv(rows, output_path):
+    output_path = Path(output_path).expanduser().resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_name = None
     try:
-        data = r.json()
-    except Exception as e:
-        log(f"HATA: JSON parse edilemedi -> {e}\nİlk 400 karakter: {r.text[:400]} ...")
-        sys.exit(1)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            newline="",
+            encoding="utf-8",
+            dir=output_path.parent,
+            prefix=f".{output_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as output:
+            temp_name = output.name
+            writer = csv.DictWriter(output, fieldnames=CSV_FIELDS)
+            writer.writeheader()
+            writer.writerows(rows)
+        os.replace(temp_name, output_path)
+    finally:
+        if temp_name and os.path.exists(temp_name):
+            os.unlink(temp_name)
+    return output_path
 
-    if "near_earth_objects" not in data:
-        log("HATA: 'near_earth_objects' alanı yok. Yanıt biçimi beklenenden farklı.")
-        sys.exit(1)
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="Download NASA near-Earth object data for the simulator."
+    )
+    parser.add_argument(
+        "--start",
+        type=parse_date,
+        default=date.today(),
+        help="first feed date in YYYY-MM-DD format (default: today)",
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        choices=range(1, 8),
+        default=4,
+        metavar="1-7",
+        help="number of feed days to request (default: 4)",
+    )
+    parser.add_argument(
+        "--output",
+        default=Path(__file__).resolve().with_name("neo_feed.csv"),
+        help="CSV destination (default: next to this script)",
+    )
+    return parser
 
-    neos_by_date = data["near_earth_objects"]
-    total = sum(len(v) for v in neos_by_date.values())
-    log(f"Toplam NEO sayısı: {total}")
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    end = args.start + timedelta(days=args.days - 1)
+    api_key = os.environ.get("NASA_API_KEY", "DEMO_KEY").strip() or "DEMO_KEY"
 
-    # Ekrana kısa özet
-    for date, neos in sorted(neos_by_date.items()):
-        log(f"{date} → {len(neos)} adet")
+    log(f"Fetching NASA NEOs: {args.start} → {end}")
+    if api_key == "DEMO_KEY":
+        log("NASA_API_KEY is not set; using NASA's rate-limited DEMO_KEY")
+    try:
+        payload = fetch_feed(args.start, end, api_key)
+        for feed_date, objects in sorted(payload["near_earth_objects"].items()):
+            log(f"{feed_date}: {len(objects)} objects")
+        rows, skipped = rows_from_feed(payload)
+        output_path = write_csv(rows, args.output)
+    except RuntimeError as error:
+        log(f"ERROR: {error}")
+        return 1
+    except OSError as error:
+        log(f"ERROR: could not write CSV: {error}")
+        return 1
 
-    # CSV yaz
-    log(f"CSV yazılıyor: {CSV_OUT}")
-    with open(CSV_OUT, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow([
-            "date", "neo_id", "name", 
-            "estimated_diameter_m_min", "estimated_diameter_m_max",
-            "is_potentially_hazardous",
-            "close_approach_date", "rel_velocity_km_h", "miss_distance_km"
-        ])
-
-        for date, neos in sorted(neos_by_date.items()):
-            for neo in neos:
-                try:
-                    diam = neo["estimated_diameter"]["meters"]
-                    dmin = diam["estimated_diameter_min"]
-                    dmax = diam["estimated_diameter_max"]
-                    hazard = neo.get("is_potentially_hazardous_asteroid", False)
-
-                    cad = neo.get("close_approach_data", [])
-                    if cad:
-                        ca = cad[0]
-                        ca_date = ca.get("close_approach_date_full") or ca.get("close_approach_date")
-                        vel = ca["relative_velocity"]["kilometers_per_hour"]
-                        miss = ca["miss_distance"]["kilometers"]
-                    else:
-                        ca_date, vel, miss = "", "", ""
-
-                    w.writerow([
-                        date, neo.get("id",""), neo.get("name",""),
-                        f"{dmin:.3f}", f"{dmax:.3f}",
-                        hazard,
-                        ca_date, vel, miss
-                    ])
-                except Exception as e:
-                    log(f"Uyarı: bir NEO satırı yazılamadı -> {e}")
-
-    log("Bitti ✅")
-    log(f"CSV dosyası konum: {os.path.abspath(CSV_OUT)}")
+    log(f"Saved {len(rows)} objects to {output_path}")
+    if skipped:
+        log(f"Skipped {skipped} malformed objects")
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

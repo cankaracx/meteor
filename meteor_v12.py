@@ -1,39 +1,21 @@
 import tkinter as tk
-from tkinter import ttk, messagebox
-import math, os
-
-
-
-
-import sys, os
-
-def resource_path(filename: str) -> str:
-    """Exe çalışırken aynı klasördeki dosyaları bulmak için"""
-    if getattr(sys, 'frozen', False):
-        # PyInstaller exe içinden
-        base = os.path.dirname(sys.executable)
-    else:
-        # Normal python script çalıştırırken
-        base = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base, filename)
-
-
-
-
-
-
-
-import sys
+from tkinter import ttk, messagebox, filedialog
+import csv
+import math, os, sys
 
 def resource_path(relpath: str) -> str:
-    # PyInstaller ile paketlenmişse sys._MEIPASS olur
-    base = getattr(sys, "_MEIPASS", os.path.abspath("."))
-    return os.path.join(base, relpath)
-
-
-
-
-
+    """Resolve data files next to the script, the frozen exe, or the PyInstaller bundle."""
+    bases = []
+    if getattr(sys, "frozen", False):
+        bases.append(getattr(sys, "_MEIPASS", ""))
+        bases.append(os.path.dirname(sys.executable))
+    bases.append(os.path.dirname(os.path.abspath(__file__)))
+    bases.append(os.path.abspath("."))
+    for base in (b for b in bases if b):
+        candidate = os.path.join(base, relpath)
+        if os.path.exists(candidate):
+            return candidate
+    return os.path.join(next(b for b in bases if b), relpath)
 
 
 # ===================== NASA NeoWs CSV -> PRESET dönüştürücü =====================
@@ -288,12 +270,17 @@ class MeteorCitySim:
                         font=("Segoe UI", 10, "bold"))
         cols = ("City","Dens(/km²)","PopCap","Dead","Injured")
         self.tree = ttk.Treeview(side, columns=cols, show="headings", height=18, style="Treeview")
-        for c in cols: self.tree.heading(c, text=c)
+        for c in cols:
+            self.tree.heading(c, text=c, command=lambda col=c: self.sort_table(col))
         self.tree.pack(fill="both", expand=True, padx=12, pady=12)
+        tk.Button(side, text="Export table (CSV)", command=self.export_table, **btn_style).pack(fill="x", padx=12, pady=(0,8))
 
         # İlk çizim
         self.last_D = None
         self.last_E_Mt = None
+        self._rows = []
+        self._sort_col = "Dead"
+        self._sort_rev = True
         self.canvas.bind("<Configure>", lambda e: self.draw_scene(self.last_D))
 
     def apply_preset(self):
@@ -312,7 +299,7 @@ class MeteorCitySim:
         ve combobox listesini tazeler.
         """
         try:
-            added = load_presets_from_csv("neo_feed.csv")
+            added = load_presets_from_csv(resource_path("neo_feed.csv"))
         except Exception as e:
             messagebox.showerror("Hata", f"CSV okunamadı:\n{e}")
             return
@@ -418,13 +405,42 @@ class MeteorCitySim:
                               f"Crater: {D:.2f} km — {level}")
 
         # 81 il tablosu — nüfus tavanıyla sınırlı
-        for r in self.tree.get_children():
-            self.tree.delete(r)
-        for city in sorted(TURKEY_81):
+        self._rows = []
+        for city in TURKEY_81:
             dens = CITY_DENSITIES_81.get(city, 60.0)
             pop_cap = CITY_POP_CAP.get(city, DEFAULT_POP_GUESS)
             dead, inj = casualties_capped(D, dens, pop_cap)
+            self._rows.append((city, dens, pop_cap, dead, inj))
+        self.refresh_table()
+
+    def sort_table(self, col):
+        if self._sort_col == col:
+            self._sort_rev = not self._sort_rev
+        else:
+            self._sort_col = col
+            self._sort_rev = col != "City"
+        self.refresh_table()
+
+    def refresh_table(self):
+        idx = {"City": 0, "Dens(/km²)": 1, "PopCap": 2, "Dead": 3, "Injured": 4}[self._sort_col]
+        rows = sorted(self._rows, key=lambda r: r[idx] if idx else r[0].casefold(), reverse=self._sort_rev)
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        for city, dens, pop_cap, dead, inj in rows:
             self.tree.insert("", "end", values=(city, dens, f"{pop_cap:,}", f"{dead:,}", f"{inj:,}"))
+
+    def export_table(self):
+        if not self._rows:
+            messagebox.showinfo("Info", "Run IMPACT first."); return
+        path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")])
+        if not path:
+            return
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["City", "Density_per_km2", "PopCap", "Dead", "Injured"])
+            for row in self._rows:
+                w.writerow(row)
+        messagebox.showinfo("Saved", path)
 
     def open_seismic(self):
         if not self.last_D:
@@ -518,6 +534,7 @@ class SeismicMapWindow:
         self.offy = 0.0
         self.dragging = False
         self.drag_start = (0,0)
+        self.drag_moved = 0
 
         self.crater_km = crater_km
         self.city_points = []  # (name, x_screen, y_screen)
@@ -629,10 +646,12 @@ class SeismicMapWindow:
     def start_drag(self, e):
         self.dragging = True
         self.drag_start = (e.x, e.y)
+        self.drag_moved = 0
 
     def drag_move(self, e):
         if not self.dragging: return
         dx, dy = e.x - self.drag_start[0], e.y - self.drag_start[1]
+        self.drag_moved += abs(dx) + abs(dy)
         self.offx += dx; self.offy += dy
         self.drag_start = (e.x, e.y)
         self.redraw()
@@ -660,6 +679,8 @@ class SeismicMapWindow:
         self.redraw()
 
     def on_click(self, e):
+        if self.drag_moved > 6:
+            return
         # En yakın şehir (25 px)
         nearest, best = None, 1e18
         for name, x, y in self.city_points:
@@ -709,6 +730,8 @@ class NeedsPlanner:
         tk.Spinbox(controls, from_=1, to=120, textvariable=self.days_var, width=5).pack(side="left", padx=6)
         tk.Button(controls, text="Hesapla", command=self.render, bg="#111", fg="#ff2a2a",
                   activebackground="#1c1c1c", activeforeground="#ffd6d6", relief="flat").pack(side="left", padx=8)
+        tk.Button(controls, text="CSV kaydet", command=self.export_csv, bg="#111", fg="#ff2a2a",
+                  activebackground="#1c1c1c", activeforeground="#ffd6d6", relief="flat").pack(side="left", padx=8)
 
         self.txt = tk.Text(self.top, bg="#0f0f0f", fg="#ffd6d6", insertbackground="#ffd6d6",
                            font=("Consolas", 11), borderwidth=0, highlightthickness=0)
@@ -725,6 +748,7 @@ class NeedsPlanner:
         sep    = "---------------+-----------+-----------+-------+----------+----------------+---------+---------+----------+-----------"
         lines.append(header); lines.append(sep)
 
+        rows = []
         for city in sorted(TURKEY_81):
             dens = CITY_DENSITIES_81.get(city, 60.0)
             pop_cap = CITY_POP_CAP.get(city, DEFAULT_POP_GUESS)
@@ -738,6 +762,7 @@ class NeedsPlanner:
             toilets    = (displaced + 19)//20
             blankets   = displaced
             powerbanks = (displaced + 9)//10
+            rows.append((city, pop_cap, displaced, tents, water_l, calories, medkits, toilets, blankets, powerbanks))
 
             lines.append(
                 f"{city:<15} | {pop_cap:>9,} | {displaced:>9,} | {tents:>5,} | {water_l:>8,} | "
@@ -746,6 +771,22 @@ class NeedsPlanner:
 
         self.txt.delete("1.0", "end")
         self.txt.insert("1.0", "\n".join(lines))
+        self._export_rows = rows
+
+    def export_csv(self):
+        rows = getattr(self, "_export_rows", None)
+        if not rows:
+            self.render()
+            rows = self._export_rows
+        path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")])
+        if not path:
+            return
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["City", "PopCap", "Displaced", "Tents", "Water_L", "Calories_kcal", "MedKits", "Toilets", "Blankets", "Powerbanks"])
+            for r in rows:
+                w.writerow(r)
+        messagebox.showinfo("Saved", path)
 
 # =========================== NÜFUS DÜZENLEYİCİ ===========================
 class PopEditor:
